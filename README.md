@@ -51,7 +51,7 @@
 
 ## 🎯 Overview
 
-**OmniMatch AI v2** is an enterprise-grade AI-powered entity resolution pipeline that automatically matches products across competing retailers — **Abt Electronics** and **Buy.com** — enabling dynamic competitive pricing strategies and comprehensive market intelligence.
+**OmniMatch AI** is an enterprise-grade AI-powered entity resolution pipeline that automatically matches products across competing retailers — **Abt Electronics** and **Buy.com** — enabling dynamic competitive pricing strategies and comprehensive market intelligence.
 
 ### What makes this project unique?
 
@@ -91,14 +91,6 @@ A multi-strategy hybrid AI pipeline that:
 | **Cortex Agents** | **3** | Product Matching, Price Optimization, Market Intelligence |
 | **Snowflake Features** | **17** | See full list below |
 
-### v2 vs v1 Improvement
-
-| Metric | v1 (Original) | v2 (Redesigned) | Improvement |
-|--------|--------------|-----------------|-------------|
-| Precision | 87.82% | **94.33%** | +6.51% |
-| Recall | 72.29% | **72.84%** | +0.55% |
-| F1 Score | 79.30% | **82.20%** | +2.90% |
-| False Positives | 110 | **48** | **-56% fewer errors** |
 
 ---
 

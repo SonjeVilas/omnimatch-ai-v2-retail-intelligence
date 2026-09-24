@@ -1,0 +1,321 @@
+-- ============================================================================
+-- OMNIMATCH AI v2: RETAIL INTELLIGENCE PLATFORM (REDESIGNED)
+-- File 07: EXECUTION SCRIPT — Run the entire pipeline end-to-end
+-- ============================================================================
+-- Prerequisites: Run files 01-06 in order FIRST (they create all objects).
+-- Then run THIS file to populate data through the pipeline.
+-- ============================================================================
+
+USE ROLE ACCOUNTADMIN;
+USE WAREHOUSE RETAIL_AI_V2_WH;
+USE DATABASE RETAIL_INTELLIGENCE_V2_DB;
+
+-- ============================================================================
+-- STEP 1: Verify Dynamic Tables are populated
+-- ============================================================================
+SELECT 'DT_CLEAN_ABT' AS SOURCE, COUNT(*) AS ROW_COUNT FROM CORE.DT_CLEAN_ABT_CATALOG
+UNION ALL
+SELECT 'DT_CLEAN_BUY', COUNT(*) FROM CORE.DT_CLEAN_BUY_CATALOG
+UNION ALL
+SELECT 'RAW_ABT', COUNT(*) FROM CORE.RAW_ABT_CATALOG
+UNION ALL
+SELECT 'RAW_BUY', COUNT(*) FROM CORE.RAW_BUY_CATALOG
+UNION ALL
+SELECT 'GROUND_TRUTH', COUNT(*) FROM CORE.GROUND_TRUTH_MAPPING;
+-- Expected: 1070, 1092, 1070, 1092, 1097
+
+-- ============================================================================
+-- STEP 2: Generate Cortex Embeddings for all products
+-- ============================================================================
+USE SCHEMA CORTEX_AI;
+
+-- Clear and regenerate Abt embeddings
+TRUNCATE TABLE ABT_EMBEDDINGS;
+INSERT INTO ABT_EMBEDDINGS (PRODUCT_ID, PRODUCT_NAME, BRAND, EXTRACTED_MODEL, CLEAN_PRICE, EMBEDDING_TEXT, EMBEDDING)
+SELECT
+    ID, NAME, BRAND, EXTRACTED_MODEL, CLEAN_PRICE, EMBEDDING_TEXT,
+    SNOWFLAKE.CORTEX.EMBED_TEXT_768('snowflake-arctic-embed-m', LEFT(EMBEDDING_TEXT, 512))::VECTOR(FLOAT, 768)
+FROM RETAIL_INTELLIGENCE_V2_DB.CORE.DT_CLEAN_ABT_CATALOG;
+
+-- Clear and regenerate Buy embeddings
+TRUNCATE TABLE BUY_EMBEDDINGS;
+INSERT INTO BUY_EMBEDDINGS (PRODUCT_ID, PRODUCT_NAME, BRAND, EXTRACTED_MODEL, CLEAN_PRICE, EMBEDDING_TEXT, EMBEDDING)
+SELECT
+    ID, NAME, BRAND, EXTRACTED_MODEL, CLEAN_PRICE, EMBEDDING_TEXT,
+    SNOWFLAKE.CORTEX.EMBED_TEXT_768('snowflake-arctic-embed-m', LEFT(EMBEDDING_TEXT, 512))::VECTOR(FLOAT, 768)
+FROM RETAIL_INTELLIGENCE_V2_DB.CORE.DT_CLEAN_BUY_CATALOG;
+
+-- Verify
+SELECT 'ABT_EMBEDDINGS' AS TBL, COUNT(*) AS CNT FROM ABT_EMBEDDINGS
+UNION ALL SELECT 'BUY_EMBEDDINGS', COUNT(*) FROM BUY_EMBEDDINGS;
+-- Expected: 1070, 1092
+
+-- ============================================================================
+-- STEP 3: Run Entity Resolution (top-1 match per Abt product, threshold 0.45)
+-- ============================================================================
+TRUNCATE TABLE FINAL_PRODUCT_MATCHES;
+
+INSERT INTO FINAL_PRODUCT_MATCHES (
+    MATCH_ID, ABT_ID, BUY_ID, ABT_NAME, BUY_NAME,
+    ABT_BRAND, BUY_BRAND, ABT_PRICE, BUY_PRICE,
+    PRICE_DIFFERENCE, PRICE_GAP_PCT,
+    VECTOR_SCORE, TOKEN_SCORE, MODEL_SCORE, BRAND_SCORE, COMPOSITE_SCORE,
+    MATCH_STRATEGY, LLM_VERIFICATION, LLM_REASONING, IS_HIGH_CONFIDENCE
+)
+SELECT
+    MD5(ABT_ID::VARCHAR || '-' || BUY_ID::VARCHAR),
+    ABT_ID, BUY_ID, ABT_NAME, BUY_NAME,
+    ABT_BRAND, BUY_BRAND, ABT_PRICE, BUY_PRICE,
+    CASE WHEN ABT_PRICE IS NOT NULL AND BUY_PRICE IS NOT NULL THEN ROUND(ABT_PRICE - BUY_PRICE, 2) END,
+    CASE WHEN ABT_PRICE IS NOT NULL AND BUY_PRICE IS NOT NULL AND BUY_PRICE > 0
+         THEN ROUND(((ABT_PRICE - BUY_PRICE) / BUY_PRICE) * 100, 2) END,
+    VECTOR_SCORE, TOKEN_SCORE, MODEL_SCORE, BRAND_SCORE, COMPOSITE_SCORE,
+    CASE
+        WHEN MODEL_SCORE >= 0.85 THEN 'EXACT_MODEL_MATCH'
+        WHEN VECTOR_SCORE >= 0.70 THEN 'CORTEX_VECTOR_SEMANTIC'
+        WHEN TOKEN_SCORE >= 0.50 THEN 'TOKEN_FUZZY_MATCH'
+        ELSE 'HYBRID_ENSEMBLE'
+    END,
+    'PENDING', 'Pending LLM verification',
+    CASE WHEN COMPOSITE_SCORE >= 0.75 THEN TRUE ELSE FALSE END
+FROM (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY ABT_ID ORDER BY COMPOSITE_SCORE DESC) AS RN
+    FROM V_CANDIDATE_MATCHES
+    WHERE COMPOSITE_SCORE >= 0.45
+)
+WHERE RN = 1;
+
+-- Verify
+SELECT COUNT(*) AS TOTAL_MATCHES FROM FINAL_PRODUCT_MATCHES;
+-- Expected: ~921 (pre-LLM), ~887 (post-LLM rejection)
+
+-- ============================================================================
+-- STEP 4: LLM Verification — auto-confirm high confidence, LLM-verify uncertain
+-- ============================================================================
+
+-- 4a: Auto-confirm high-confidence matches (>= 0.80)
+UPDATE FINAL_PRODUCT_MATCHES
+SET LLM_VERIFICATION = 'CONFIRMED',
+    LLM_REASONING = 'Auto-confirmed: composite score above 0.80 with strong multi-signal agreement',
+    IS_HIGH_CONFIDENCE = TRUE
+WHERE COMPOSITE_SCORE >= 0.80 AND LLM_VERIFICATION = 'PENDING';
+
+-- 4b: LLM-verify uncertain matches (0.50 - 0.80) using Cortex COMPLETE
+-- This calls llama3.1-70b for each uncertain match — may take 5-10 minutes for ~150 rows
+CREATE OR REPLACE TEMPORARY TABLE _LLM_BATCH AS
+SELECT
+    MATCH_ID, ABT_NAME, BUY_NAME, ABT_BRAND, BUY_BRAND,
+    COMPOSITE_SCORE, VECTOR_SCORE, MODEL_SCORE,
+    SNOWFLAKE.CORTEX.COMPLETE(
+        'llama3.1-70b',
+        'You are a product matching expert. Determine if these two product listings refer to the SAME physical product.
+Product A (Abt): ' || ABT_NAME || '
+Product B (Buy.com): ' || BUY_NAME || '
+Matching signals: Vector similarity: ' || ROUND(VECTOR_SCORE, 3)::VARCHAR ||
+        ', Model similarity: ' || ROUND(MODEL_SCORE, 3)::VARCHAR ||
+        ', Brand A: ' || ABT_BRAND || ', Brand B: ' || BUY_BRAND || '
+Respond ONLY with this JSON: {"verdict": "CONFIRMED" or "REJECTED", "reason": "one sentence"}'
+    ) AS LLM_RESPONSE
+FROM FINAL_PRODUCT_MATCHES
+WHERE LLM_VERIFICATION = 'PENDING' AND COMPOSITE_SCORE BETWEEN 0.50 AND 0.80
+LIMIT 200;
+
+-- Apply LLM results
+UPDATE FINAL_PRODUCT_MATCHES f
+SET f.LLM_VERIFICATION = COALESCE(TRY_PARSE_JSON(b.LLM_RESPONSE):verdict::VARCHAR, 'UNCERTAIN'),
+    f.LLM_REASONING = COALESCE(TRY_PARSE_JSON(b.LLM_RESPONSE):reason::VARCHAR, LEFT(b.LLM_RESPONSE, 500))
+FROM _LLM_BATCH b
+WHERE f.MATCH_ID = b.MATCH_ID;
+
+DROP TABLE IF EXISTS _LLM_BATCH;
+
+-- 4c: Remove LLM-rejected matches to preserve precision
+DELETE FROM FINAL_PRODUCT_MATCHES WHERE LLM_VERIFICATION = 'REJECTED';
+
+-- Verify verification status
+SELECT LLM_VERIFICATION, COUNT(*) AS CNT
+FROM FINAL_PRODUCT_MATCHES GROUP BY LLM_VERIFICATION ORDER BY CNT DESC;
+-- Expected: ~887 CONFIRMED, 0 REJECTED
+
+-- ============================================================================
+-- STEP 5: Generate Pricing Recommendations for ALL 4 strategies
+-- ============================================================================
+USE SCHEMA ANALYTICS;
+
+-- Helper: common pricing INSERT logic per strategy
+-- Strategy params: (undercut_pct, min_margin_pct, max_discount_pct, premium_pct)
+--   AGGRESSIVE_UNDERCUT: 2.5%, 10%, 25%, 0%
+--   PRICE_MATCHER:       0%,   12%, 20%, 0%
+--   MARGIN_MAXIMIZER:    1%,   18%, 15%, 4%
+--   BRAND_PROTECT:       0.5%, 20%, 10%, 0%
+
+TRUNCATE TABLE PRICING_RECOMMENDATIONS;
+
+-- 5a: Aggressive Undercut (undercut 2.5%, margin floor 10%, max discount 25%)
+INSERT INTO PRICING_RECOMMENDATIONS
+SELECT
+    MD5(cpi.MATCH_ID || '-AGGRESSIVE_UNDERCUT'), cpi.MATCH_ID, 'AGGRESSIVE_UNDERCUT',
+    cpi.ABT_ID, cpi.ABT_NAME, cpi.ABT_BRAND,
+    cpi.ABT_PRICE, cpi.BUY_PRICE, cpi.ESTIMATED_UNIT_COST,
+    cpi.CURRENT_MARGIN_PCT, cpi.COMPETITIVE_STATUS,
+    ROUND(GREATEST(
+        cpi.ESTIMATED_UNIT_COST * 1.10,
+        COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.75,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE * 0.975
+             ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) END
+    ), 2) AS RECOMMENDED_PRICE,
+    ROUND(((GREATEST(cpi.ESTIMATED_UNIT_COST * 1.10, COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.75,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE * 0.975 ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) END)
+        - COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE)) / NULLIF(COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE), 0)) * 100, 2),
+    ROUND(((GREATEST(cpi.ESTIMATED_UNIT_COST * 1.10, COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.75,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE * 0.975 ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) END)
+        - cpi.ESTIMATED_UNIT_COST) / NULLIF(GREATEST(cpi.ESTIMATED_UNIT_COST * 1.10, COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.75,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE * 0.975 ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) END), 0)) * 100, 2),
+    ROUND(1.65 * ABS(((GREATEST(cpi.ESTIMATED_UNIT_COST * 1.10, COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.75,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE * 0.975 ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) END)
+        - COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE)) / NULLIF(COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE), 0))) * 100, 2),
+    ROUND((30 * (GREATEST(cpi.ESTIMATED_UNIT_COST * 1.10, COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.75,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE * 0.975 ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) END)
+        - cpi.ESTIMATED_UNIT_COST)) - (30 * (COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) - cpi.ESTIMATED_UNIT_COST)), 2),
+    CASE WHEN cpi.COMPETITIVE_STATUS = 'BUY_WINNING' THEN 'Re-price to Win'
+         WHEN cpi.COMPETITIVE_STATUS = 'ABT_WINNING' THEN 'Margin Expansion'
+         WHEN cpi.COMPETITIVE_STATUS = 'PRICE_PARITY' THEN 'Maintain Parity'
+         ELSE 'Set Catalog Price' END,
+    CURRENT_TIMESTAMP()
+FROM V_COMPETITIVE_PRICE_INDEX cpi
+WHERE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) > 0;
+
+-- 5b: Price Matcher (undercut 0%, margin floor 12%, max discount 20%)
+INSERT INTO PRICING_RECOMMENDATIONS
+SELECT
+    MD5(cpi.MATCH_ID || '-PRICE_MATCHER'), cpi.MATCH_ID, 'PRICE_MATCHER',
+    cpi.ABT_ID, cpi.ABT_NAME, cpi.ABT_BRAND,
+    cpi.ABT_PRICE, cpi.BUY_PRICE, cpi.ESTIMATED_UNIT_COST,
+    cpi.CURRENT_MARGIN_PCT, cpi.COMPETITIVE_STATUS,
+    ROUND(GREATEST(
+        cpi.ESTIMATED_UNIT_COST * 1.12,
+        COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.80,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE
+             ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) END
+    ), 2),
+    ROUND(((GREATEST(cpi.ESTIMATED_UNIT_COST * 1.12, COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.80,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) END)
+        - COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE)) / NULLIF(COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE), 0)) * 100, 2),
+    ROUND(((GREATEST(cpi.ESTIMATED_UNIT_COST * 1.12, COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.80,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) END)
+        - cpi.ESTIMATED_UNIT_COST) / NULLIF(GREATEST(cpi.ESTIMATED_UNIT_COST * 1.12, COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.80,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) END), 0)) * 100, 2),
+    ROUND(1.65 * ABS(((GREATEST(cpi.ESTIMATED_UNIT_COST * 1.12, COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.80,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) END)
+        - COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE)) / NULLIF(COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE), 0))) * 100, 2),
+    ROUND((30 * (GREATEST(cpi.ESTIMATED_UNIT_COST * 1.12, COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.80,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) END)
+        - cpi.ESTIMATED_UNIT_COST)) - (30 * (COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) - cpi.ESTIMATED_UNIT_COST)), 2),
+    CASE WHEN cpi.COMPETITIVE_STATUS = 'BUY_WINNING' THEN 'Re-price to Win'
+         WHEN cpi.COMPETITIVE_STATUS = 'ABT_WINNING' THEN 'Margin Expansion'
+         WHEN cpi.COMPETITIVE_STATUS = 'PRICE_PARITY' THEN 'Maintain Parity'
+         ELSE 'Set Catalog Price' END,
+    CURRENT_TIMESTAMP()
+FROM V_COMPETITIVE_PRICE_INDEX cpi
+WHERE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) > 0;
+
+-- 5c: Margin Maximizer (undercut 1%, margin floor 18%, max discount 15%, premium 4%)
+INSERT INTO PRICING_RECOMMENDATIONS
+SELECT
+    MD5(cpi.MATCH_ID || '-MARGIN_MAXIMIZER'), cpi.MATCH_ID, 'MARGIN_MAXIMIZER',
+    cpi.ABT_ID, cpi.ABT_NAME, cpi.ABT_BRAND,
+    cpi.ABT_PRICE, cpi.BUY_PRICE, cpi.ESTIMATED_UNIT_COST,
+    cpi.CURRENT_MARGIN_PCT, cpi.COMPETITIVE_STATUS,
+    ROUND(GREATEST(
+        cpi.ESTIMATED_UNIT_COST * 1.18,
+        COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.85,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE * 0.99
+             ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 1.04 END
+    ), 2),
+    ROUND(((GREATEST(cpi.ESTIMATED_UNIT_COST * 1.18, COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.85,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE * 0.99 ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 1.04 END)
+        - COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE)) / NULLIF(COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE), 0)) * 100, 2),
+    ROUND(((GREATEST(cpi.ESTIMATED_UNIT_COST * 1.18, COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.85,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE * 0.99 ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 1.04 END)
+        - cpi.ESTIMATED_UNIT_COST) / NULLIF(GREATEST(cpi.ESTIMATED_UNIT_COST * 1.18, COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.85,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE * 0.99 ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 1.04 END), 0)) * 100, 2),
+    ROUND(1.65 * ABS(((GREATEST(cpi.ESTIMATED_UNIT_COST * 1.18, COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.85,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE * 0.99 ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 1.04 END)
+        - COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE)) / NULLIF(COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE), 0))) * 100, 2),
+    ROUND((30 * (GREATEST(cpi.ESTIMATED_UNIT_COST * 1.18, COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.85,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE * 0.99 ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 1.04 END)
+        - cpi.ESTIMATED_UNIT_COST)) - (30 * (COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) - cpi.ESTIMATED_UNIT_COST)), 2),
+    CASE WHEN cpi.COMPETITIVE_STATUS = 'BUY_WINNING' THEN 'Re-price to Win'
+         WHEN cpi.COMPETITIVE_STATUS = 'ABT_WINNING' THEN 'Margin Expansion'
+         WHEN cpi.COMPETITIVE_STATUS = 'PRICE_PARITY' THEN 'Maintain Parity'
+         ELSE 'Set Catalog Price' END,
+    CURRENT_TIMESTAMP()
+FROM V_COMPETITIVE_PRICE_INDEX cpi
+WHERE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) > 0;
+
+-- 5d: MAP & Brand Protect (undercut 0.5%, margin floor 20%, max discount 10%)
+INSERT INTO PRICING_RECOMMENDATIONS
+SELECT
+    MD5(cpi.MATCH_ID || '-BRAND_PROTECT'), cpi.MATCH_ID, 'BRAND_PROTECT',
+    cpi.ABT_ID, cpi.ABT_NAME, cpi.ABT_BRAND,
+    cpi.ABT_PRICE, cpi.BUY_PRICE, cpi.ESTIMATED_UNIT_COST,
+    cpi.CURRENT_MARGIN_PCT, cpi.COMPETITIVE_STATUS,
+    ROUND(GREATEST(
+        cpi.ESTIMATED_UNIT_COST * 1.20,
+        COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.90,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE * 0.995
+             ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) END
+    ), 2),
+    ROUND(((GREATEST(cpi.ESTIMATED_UNIT_COST * 1.20, COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.90,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE * 0.995 ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) END)
+        - COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE)) / NULLIF(COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE), 0)) * 100, 2),
+    ROUND(((GREATEST(cpi.ESTIMATED_UNIT_COST * 1.20, COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.90,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE * 0.995 ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) END)
+        - cpi.ESTIMATED_UNIT_COST) / NULLIF(GREATEST(cpi.ESTIMATED_UNIT_COST * 1.20, COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.90,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE * 0.995 ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) END), 0)) * 100, 2),
+    ROUND(1.65 * ABS(((GREATEST(cpi.ESTIMATED_UNIT_COST * 1.20, COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.90,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE * 0.995 ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) END)
+        - COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE)) / NULLIF(COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE), 0))) * 100, 2),
+    ROUND((30 * (GREATEST(cpi.ESTIMATED_UNIT_COST * 1.20, COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) * 0.90,
+        CASE WHEN cpi.BUY_PRICE > 0 THEN cpi.BUY_PRICE * 0.995 ELSE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) END)
+        - cpi.ESTIMATED_UNIT_COST)) - (30 * (COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) - cpi.ESTIMATED_UNIT_COST)), 2),
+    CASE WHEN cpi.COMPETITIVE_STATUS = 'BUY_WINNING' THEN 'Re-price to Win'
+         WHEN cpi.COMPETITIVE_STATUS = 'ABT_WINNING' THEN 'Margin Expansion'
+         WHEN cpi.COMPETITIVE_STATUS = 'PRICE_PARITY' THEN 'Maintain Parity'
+         ELSE 'Set Catalog Price' END,
+    CURRENT_TIMESTAMP()
+FROM V_COMPETITIVE_PRICE_INDEX cpi
+WHERE COALESCE(cpi.ABT_PRICE, cpi.BUY_PRICE) > 0;
+
+-- Verify all 4 strategies
+SELECT STRATEGY_ID, COUNT(*) AS RECOMMENDATIONS
+FROM PRICING_RECOMMENDATIONS GROUP BY STRATEGY_ID ORDER BY STRATEGY_ID;
+-- Expected: ~631 each, 4 rows
+
+-- ============================================================================
+-- STEP 6: Record initial evaluation snapshot
+-- ============================================================================
+SELECT * FROM ANALYTICS.V_BENCHMARK_METRICS;
+-- Expected: Precision ~94.4%, Recall ~76.3%, F1 ~84.4%
+
+-- ============================================================================
+-- STEP 7: Final verification — all object counts
+-- ============================================================================
+SELECT 'RAW_ABT' AS OBJECT, COUNT(*) AS ROWS FROM CORE.RAW_ABT_CATALOG
+UNION ALL SELECT 'RAW_BUY', COUNT(*) FROM CORE.RAW_BUY_CATALOG
+UNION ALL SELECT 'GROUND_TRUTH', COUNT(*) FROM CORE.GROUND_TRUTH_MAPPING
+UNION ALL SELECT 'DT_CLEAN_ABT', COUNT(*) FROM CORE.DT_CLEAN_ABT_CATALOG
+UNION ALL SELECT 'DT_CLEAN_BUY', COUNT(*) FROM CORE.DT_CLEAN_BUY_CATALOG
+UNION ALL SELECT 'ABT_EMBEDDINGS', COUNT(*) FROM CORTEX_AI.ABT_EMBEDDINGS
+UNION ALL SELECT 'BUY_EMBEDDINGS', COUNT(*) FROM CORTEX_AI.BUY_EMBEDDINGS
+UNION ALL SELECT 'FINAL_MATCHES', COUNT(*) FROM CORTEX_AI.FINAL_PRODUCT_MATCHES
+UNION ALL SELECT 'PRICING_RECS', COUNT(*) FROM ANALYTICS.PRICING_RECOMMENDATIONS
+UNION ALL SELECT 'MARKET_INTEL', COUNT(*) FROM ANALYTICS.V_MARKET_INTELLIGENCE
+UNION ALL SELECT 'ANOMALIES', COUNT(*) FROM ANALYTICS.V_MARKET_ANOMALIES;
+
+-- ============================================================================
+-- DONE! The pipeline is fully populated. You can now:
+-- 1. Open the Streamlit app (omnimatch-ai-v2/) and click Run
+-- 2. Go to AI & ML > Agents in Snowsight to chat with the 3 agents
+-- 3. Run evaluation: SELECT * FROM ANALYTICS.V_BENCHMARK_METRICS;
+-- ============================================================================

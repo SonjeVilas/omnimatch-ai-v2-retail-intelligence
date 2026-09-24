@@ -1,0 +1,73 @@
+# ===========================
+# OmniMatch AI v2 - .gitignore
+# ===========================
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.conda/
+sf_env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.lnk
+
+# Snowflake
+.snowflake/
+snowflake_credentials.json
+snowflake_env.json
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Environment files
+.env
+.env.local
+.env.production
+*.env
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.orig
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# Data files (if any local copies)
+*.csv
+*.parquet
+*.json
+!snowflake.yml
+!pyproject.toml
+!.streamlit/config.toml

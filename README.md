@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/SQL-4479A1?style=for-the-badge&logo=postgresql&logoColor=white" alt="SQL"/>
 </p>
 
-<h1 align="center">⚡ OmniMatch AI v2: Retail Intelligence Platform</h1>
+<h1 align="center">⚡ OmniMatch AI: Retail Intelligence Platform</h1>
 
 <p align="center">
   <strong>AI-Powered Product Entity Resolution, Dynamic Pricing & Market Intelligence</strong><br/>

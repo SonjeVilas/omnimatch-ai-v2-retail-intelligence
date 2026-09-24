@@ -1,4 +1,4 @@
-copy "C:\Users\Lenovo\.gemini\antigravity-ide\brain\7e1072b0-f74e-4a0c-ab4e-db2c988726f5\architecture_diagram_1790233541020.jpg" "C:\Users\Lenovo\Desktop\retail-intelligence-platform (1)\architecture.jpg"
+![OmniMatch AI v2 Architecture](architecture.jpg)
 
 
 
